@@ -1,0 +1,349 @@
+#pragma kernel Simulate
+#pragma kernel Fill
+#pragma kernel Draw
+#pragma kernel BlitAll
+#pragma kernel DeleteSpecie
+#pragma kernel ImportTexture
+#pragma kernel ChangeDimensions
+#pragma kernel Colorize
+
+struct SimulationSetting
+{
+	float3x3 LaplacianMatrix;
+	float DiffusionA;
+	float DiffusionB;
+	float KillRate;
+	float FeedRate;
+};
+struct ColorBand
+{
+	float PositionInLine;
+	float4 Color;
+	float Bias;
+};
+
+Texture2D<float2> Input;
+RWTexture2D<float2> Output;
+
+Texture2D<float> InputSpeciesMap;
+RWTexture2D<float> OutputSpeciesMap;
+
+RWTexture2D<float4> Final;
+
+int TextureWidth;
+int TextureHeight;
+
+StructuredBuffer<SimulationSetting> Species;
+int NumberOfSpecies;
+
+float DrawRadius;
+float2 DrawPosition;
+int DrawIndex;
+
+Texture2D<float4> Texture;
+
+int DeleteIndex;
+
+float4 InputRectToOutput;
+
+StructuredBuffer<ColorBand> ColorBands;
+int NumberOfColorsBandPerSpecie;
+
+bool InRect(int2 id)
+{
+	return id.x < TextureWidth && id.y < TextureHeight;
+}
+int2 Repeat(int2 id)
+{
+	int2 newID = id;
+
+	if (id.x >= TextureWidth)
+	{
+		newID.x = id.x - TextureWidth;
+	}
+	if (id.y >= TextureHeight)
+	{
+		newID.y = id.y - TextureHeight;
+	}
+
+	if (id.x < 0)
+	{
+		newID.x = id.x + TextureWidth;
+	}
+	if (id.y < 0)
+	{
+		newID.y = id.y + TextureHeight;
+	}
+
+	return newID;
+}
+float Map(float Value, float MinValue, float MaxValue, float MinRange, float MaxRange)
+{
+	return (((Value - MinValue) * (MaxRange - MinRange)) / (MaxValue - MinValue)) + MinRange;
+}
+
+float2 GetAB(int2 id, int specieID, inout int maxID, inout float maxValue)
+{
+	float2 pixel = Input[id];
+	int pixelID = (int)InputSpeciesMap[id];
+
+	if (pixel.y > maxValue)
+	{
+		maxID = pixelID;
+		maxValue = pixel.y;
+	}
+
+	if (pixelID != specieID)
+	{
+		return float2(pixel.x, -pixel.y);
+	}
+
+	return pixel;
+}
+float2 Laplacian(int2 id, int pixelID, float3x3 laplaceMat, out int specieID)
+{
+	float2 lap = 0;
+
+	float2 pixel = Input[id];
+
+	int maxID = 0;
+	float maxValue = 0;
+
+	lap += GetAB(Repeat(id + int2(-1, -1)), pixelID, maxID, maxValue) * laplaceMat[0][0];
+	lap += GetAB(Repeat(id + int2(0, -1)), pixelID, maxID, maxValue) * laplaceMat[1][0];
+	lap += GetAB(Repeat(id + int2(1, -1)), pixelID, maxID, maxValue) * laplaceMat[2][0];
+
+	lap += GetAB(Repeat(id + int2(-1, 0)), pixelID, maxID, maxValue) * laplaceMat[0][1];
+	lap += pixel * laplaceMat[1][1];
+	lap += GetAB(Repeat(id + int2(1, 0)), pixelID, maxID, maxValue) * laplaceMat[2][1];
+
+	lap += GetAB(Repeat(id + int2(-1, 1)), pixelID, maxID, maxValue) * laplaceMat[0][2];
+	lap += GetAB(Repeat(id + int2(0, 1)), pixelID, maxID, maxValue) * laplaceMat[1][2];
+	lap += GetAB(Repeat(id + int2(1, 1)), pixelID, maxID, maxValue) * laplaceMat[2][2];
+
+	specieID = maxID;
+
+	return lap;
+}
+int GetSpecieIndex(int2 id)
+{
+	float value = 0;
+	int index = 0;
+
+	for (int y = -1; y <= 1; y++)
+	{
+		for (int x = -1; x <= 1; x++)
+		{
+			if (x != 0 && y != 0)
+			{
+				int2 offset = int2(x, y);
+				int2 finalID = Repeat(id + offset);
+
+				float newVal = Input[finalID].y;
+
+				if (newVal > value)
+				{
+					value = newVal;
+					index = (int)InputSpeciesMap[finalID];
+				}
+			}
+		}
+	}
+
+	return index;
+}
+
+[numthreads(8, 8, 1)]
+void Simulate(uint3 id : SV_DispatchThreadID)
+{
+	if (!InRect(id.xy))
+	{
+		return;
+	}
+
+	float2 pixel = Input[id.xy];
+	int specieID = (int)InputSpeciesMap[id.xy];
+
+	SimulationSetting specie = Species[specieID];
+
+	int maxID;
+	float2 laplace = Laplacian(id.xy, specieID, specie.LaplacianMatrix, maxID);
+
+	float ABB = pixel.x * pixel.y * pixel.y;
+
+	bool zero = pixel.y == 0;
+
+	float2 newAB = pixel.xy;
+	newAB.x += specie.DiffusionA * laplace.x - ABB + specie.FeedRate * (1 - pixel.x);
+	newAB.y += specie.DiffusionB * laplace.y + ABB - (specie.FeedRate + specie.KillRate) * pixel.y;
+
+	if (newAB.y == 0)
+	{
+		specieID = 0;
+	}
+	else if (zero)
+	{
+		specieID = maxID;
+	}
+
+	Output[id.xy] = saturate(newAB);
+	OutputSpeciesMap[id.xy] = specieID;
+}
+
+[numthreads(8, 8, 1)]
+void Fill(uint3 id : SV_DispatchThreadID)
+{
+	if (!InRect(id.xy))
+	{
+		return;
+	}
+
+	Output[id.xy] = float2(1, 0);
+	OutputSpeciesMap[id.xy] = 0;
+}
+
+[numthreads(8, 8, 1)]
+void Draw(uint3 id : SV_DispatchThreadID)
+{
+	if (!InRect(id.xy))
+	{
+		return;
+	}
+
+	float2 offset = DrawPosition - id.xy;
+	float dis = offset.x * offset.x + offset.y * offset.y;
+
+	if (dis <= DrawRadius * DrawRadius)
+	{
+		float2 pixel = Output[id.xy];
+
+		pixel.y = 1;
+
+		Output[id.xy] = pixel;
+		OutputSpeciesMap[id.xy] = DrawIndex;
+	}
+}
+
+[numthreads(8, 8, 1)]
+void BlitAll(uint3 id : SV_DispatchThreadID)
+{
+	if (!InRect(id.xy))
+	{
+		return;
+	}
+
+	Output[id.xy] = Input[id.xy];
+	OutputSpeciesMap[id.xy] = InputSpeciesMap[id.xy];
+}
+
+[numthreads(8, 8, 1)]
+void DeleteSpecie(uint3 id : SV_DispatchThreadID)
+{
+	if (!InRect(id.xy))
+	{
+		return;
+	}
+
+	int specieID = (int)OutputSpeciesMap[id.xy];
+	
+	if (specieID >= DeleteIndex)
+	{
+		OutputSpeciesMap[id.xy] = max(0, specieID - 1);
+	}
+}
+
+[numthreads(8, 8, 1)]
+void ImportTexture(uint3 id : SV_DispatchThreadID)
+{
+	if (!InRect(id.xy))
+	{
+		return;
+	}
+
+	bool biggerThan = id.x >= InputRectToOutput.x && id.y >= InputRectToOutput.y;
+	bool smallerThan = id.x < InputRectToOutput.x + InputRectToOutput.z && id.y < InputRectToOutput.y + InputRectToOutput.w;
+
+	if (biggerThan && smallerThan)
+	{
+		float2 abPixel = Output[id.xy];
+		float4 pixel = Texture[id.xy - InputRectToOutput.xy];
+
+		float newB = max(max(pixel.x, pixel.y), pixel.z);
+
+		if (newB > abPixel.y)
+		{
+			abPixel.y = newB;
+			Output[id.xy] = abPixel;
+			OutputSpeciesMap[id.xy] = DrawIndex;
+		}
+	}
+}
+
+[numthreads(8, 8, 1)]
+void ChangeDimensions(uint3 id : SV_DispatchThreadID)
+{
+	if (!InRect(id.xy))
+	{
+		return;
+	}
+
+	bool biggerThan = id.x >= InputRectToOutput.x && id.y >= InputRectToOutput.y;
+	bool smallerThan = id.x < InputRectToOutput.x + InputRectToOutput.z && id.y < InputRectToOutput.y + InputRectToOutput.w;
+
+	if (biggerThan && smallerThan)
+	{
+		Output[id.xy] = Input[id.xy - InputRectToOutput.xy];
+		OutputSpeciesMap[id.xy] = InputSpeciesMap[id.xy - InputRectToOutput.xy];
+	}
+	else
+	{
+		Output[id.xy] = float2(1, 0);
+		OutputSpeciesMap[id.xy] = 0;
+	}
+}
+
+float Biased(float bias, float x)
+{
+	float h = 1 - bias;
+	float k = h * h * h;
+
+	return (x * k) / (x * k - x + 1);
+}
+[numthreads(8, 8, 1)]
+void Colorize(uint3 id : SV_DispatchThreadID)
+{
+	if (!InRect(id.xy))
+	{
+		return;
+	}
+
+	float ABDiffrence = (Input[id.xy].y - Input[id.xy].x) * 0.5 + 0.5;
+
+	ColorBand preBand;
+
+	int start = InputSpeciesMap[id.xy] * NumberOfColorsBandPerSpecie;
+	int end = start + NumberOfColorsBandPerSpecie;
+
+	for (int i = start; i < end; i++)
+	{
+		ColorBand currentBand = ColorBands[i];
+		if (ABDiffrence <= currentBand.PositionInLine)
+		{
+			if (i == start)
+			{
+				Final[id.xy] = currentBand.Color;
+			}
+			else
+			{
+				float k = Map(ABDiffrence, preBand.PositionInLine, currentBand.PositionInLine, 0, 1);
+				Final[id.xy] = lerp(preBand.Color, currentBand.Color, Biased(currentBand.Bias, k));
+			}
+
+			return;
+		}
+
+		preBand = currentBand;
+	}
+
+	Final[id.xy] = preBand.Color;
+}

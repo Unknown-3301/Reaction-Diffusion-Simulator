@@ -1,0 +1,117 @@
+﻿#pragma kernel ThreshHold
+#pragma kernel HorizontalBlur
+#pragma kernel VerticalBlur
+#pragma kernel Bloom
+
+Texture2D<float4> InputTexture;
+RWTexture2D<float4> OutputTexture;
+
+int Width, Height;
+
+// Threshhold
+float BrightnessThreshhold;
+
+// Blur
+float BlurSize, BlurStandardDeviation;
+
+// Bloom
+float BloomStength;
+Texture2D<float4> BlurTexture;
+
+bool CheckIndexInTexture(int2 id)
+{
+	return id.x < Width && id.y < Height;
+}
+
+[numthreads(8,8,1)]
+void ThreshHold(uint3 id : SV_DispatchThreadID)
+{
+	if (!CheckIndexInTexture(id.xy))
+	{
+		return;
+	}
+
+	float3 col = OutputTexture[id.xy].xyz;
+	
+	col.x = col.x >= BrightnessThreshhold ? col.x : 0;
+	col.y = col.y >= BrightnessThreshhold ? col.y : 0;
+	col.z = col.z >= BrightnessThreshhold ? col.z : 0;
+
+	OutputTexture[id.xy] = float4(col, OutputTexture[id.xy].w);
+}
+
+[numthreads(8,8,1)]
+void HorizontalBlur(uint3 id : SV_DispatchThreadID)
+{
+	if (!CheckIndexInTexture(id.xy))
+	{
+		return;
+	}
+
+	float4 col = 0;
+	
+	int min = -BlurSize / 2;
+	int max = ceil(BlurSize / 2);
+
+	float sum = 0;
+
+	float SquaredStd = BlurStandardDeviation * BlurStandardDeviation;
+
+	for (int x = min; x < max; x++)
+	{
+		if (CheckIndexInTexture(id.xy + int2(x, 0)))
+		{
+			float Gaussian = 1 / (2.50662827463 * BlurStandardDeviation);
+			Gaussian *= pow(2.71828182846, -(x * x / (2 * SquaredStd)));
+
+			sum += Gaussian;
+
+			col += InputTexture[id.xy + int2(x, 0)] * Gaussian;
+		}
+	}
+
+	OutputTexture[id.xy] = col / sum;
+}
+[numthreads(8, 8, 1)]
+void VerticalBlur(uint3 id : SV_DispatchThreadID)
+{
+	if (!CheckIndexInTexture(id.xy))
+	{
+		return;
+	}
+
+	float4 col = 0;
+
+	int min = -BlurSize / 2;
+	int max = ceil(BlurSize / 2);
+
+	float sum = 0;
+
+	float SquaredStd = BlurStandardDeviation * BlurStandardDeviation;
+
+	for (int y = min; y < max; y++)
+	{
+		if (CheckIndexInTexture(id.xy + int2(0, y)))
+		{
+			float Gaussian = 1 / (2.50662827463 * BlurStandardDeviation);
+			Gaussian *= pow(2.71828182846, -(y * y / (2 * SquaredStd)));
+
+			sum += Gaussian;
+
+			col += InputTexture[id.xy + int2(0, y)] * Gaussian;
+		}
+	}
+
+	OutputTexture[id.xy] = col / sum;
+}
+
+[numthreads(8, 8, 1)]
+void Bloom(uint3 id : SV_DispatchThreadID)
+{
+	if (!CheckIndexInTexture(id.xy))
+	{
+		return;
+	}
+
+	OutputTexture[id.xy] = float4(InputTexture[id.xy] + BlurTexture[id.xy] * BloomStength);
+}

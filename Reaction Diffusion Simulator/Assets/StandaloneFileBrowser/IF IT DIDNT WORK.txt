@@ -1,0 +1,2 @@
+1- try deleting 'Version Control' package from package manager
+2- also try changing 'Api Compatibility Level' from '2.0 netstandard' to '.NET 4.X'
